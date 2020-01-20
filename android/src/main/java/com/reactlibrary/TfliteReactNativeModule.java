@@ -40,6 +40,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
 import java.util.Vector;
+import java.lang.Byte;
 
 public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
 
@@ -48,6 +49,7 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
   private int inputSize = 0;
   private Vector<String> labels;
   float[][] labelProb;
+  byte[][] labelProbInt;
   private static final int BYTES_PER_CHANNEL = 4;
 
 
@@ -93,6 +95,7 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
         labels.add(line);
       }
       labelProb = new float[1][labels.size()];
+      labelProbInt = new byte[1][labels.size()];
       br.close();
     } catch (IOException e) {
       throw new RuntimeException("Failed to read label file", e);
@@ -111,9 +114,18 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
               }
             });
 
-    for (int i = 0; i < labels.size(); ++i) {
-      float confidence = labelProb[0][i];
-      if (confidence > threshold) {
+    Tensor tensor = tfLite.getInputTensor(0);
+    for (int i = 0; i < labels.size(); i++) {
+      float confidence = (tensor.dataType() == DataType.FLOAT32)
+                             ? labelProb[0][i]
+                             : ((float) (Byte.toUnsignedInt(labelProbInt[0][i]))) / 255;
+
+      if (
+        tensor.dataType() == DataType.FLOAT32 &&
+          confidence > threshold
+        ||
+        tensor.dataType() == DataType.UINT8
+      ) {
         WritableMap res = Arguments.createMap();
         res.putInt("index", i);
         res.putString("label", labels.size() > i ? labels.get(i) : "unknown");
@@ -130,13 +142,20 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
     return results;
   }
 
-  ByteBuffer feedInputTensorImage(String path, float mean, float std) throws IOException {
+  ByteBuffer feedInputTensorImage(String pathOrBase64String, float mean, float std) throws IOException {
     Tensor tensor = tfLite.getInputTensor(0);
     inputSize = tensor.shape()[1];
     int inputChannels = tensor.shape()[3];
 
-    InputStream inputStream = new FileInputStream(path.replace("file://", ""));
-    Bitmap bitmapRaw = BitmapFactory.decodeStream(inputStream);
+    Bitmap bitmapRaw;
+    if ( pathOrBase64String.contains("file://") ) {
+      InputStream inputStream = new FileInputStream(pathOrBase64String.replace("file://", ""));
+      bitmapRaw = BitmapFactory.decodeStream(inputStream);
+
+    } else {
+      byte[] encodeByte = Base64.decode(pathOrBase64String, Base64.NO_WRAP);
+      bitmapRaw = BitmapFactory.decodeByteArray(encodeByte, 0, encodeByte.length);
+    }
 
     Matrix matrix = getTransformationMatrix(bitmapRaw.getWidth(), bitmapRaw.getHeight(),
         inputSize, inputSize, false);
@@ -174,7 +193,12 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
   private void runModelOnImage(final String path, final float mean, final float std, final int numResults,
                                final float threshold, final Callback callback) throws IOException {
 
-    tfLite.run(feedInputTensorImage(path, mean, std), labelProb);
+    Tensor tensor = tfLite.getInputTensor(0);
+    if ((tensor.dataType() == DataType.FLOAT32)) {
+      tfLite.run(feedInputTensorImage(path, mean, std), labelProb);
+    } else {
+      tfLite.run(feedInputTensorImage(path, mean, std), labelProbInt);
+    }
 
     callback.invoke(null, GetTopN(numResults, threshold));
   }
@@ -757,6 +781,7 @@ public class TfliteReactNativeModule extends ReactContextBaseJavaModule {
     tfLite.close();
     labels = null;
     labelProb = null;
+    labelProbInt = null;
   }
 
 

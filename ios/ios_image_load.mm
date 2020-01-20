@@ -70,3 +70,33 @@ std::vector<uint8_t> LoadImageFromFile(const char* file_name,
   *out_channels = channels;
   return result;
 }
+
+
+std::vector<uint8_t> LoadImageFromBase64String(NSString *base64String,
+                                       int* out_width, int* out_height,
+                                       int* out_channels) {
+    
+    CGImageRef image = [[UIImage imageWithData:[[NSData alloc]initWithBase64EncodedString:base64String options:NSDataBase64DecodingIgnoreUnknownCharacters]] CGImage];
+    
+    int width = (int)CGImageGetWidth(image);
+    int height = (int)CGImageGetHeight(image);
+    const int channels = 4;
+    CGColorSpaceRef color_space = CGColorSpaceCreateDeviceRGB();
+    const int bytes_per_row = (width * channels);
+    const int bytes_in_image = (bytes_per_row * height);
+    std::vector<uint8_t> result(bytes_in_image);
+    const int bits_per_component = 8;
+    
+    CGContextRef context = CGBitmapContextCreate(result.data(), width, height,
+                                                 bits_per_component, bytes_per_row, color_space,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    CGColorSpaceRelease(color_space);
+    CGContextDrawImage(context, CGRectMake(0, 0, width, height), image);
+    CGContextRelease(context);
+    // CFRelease(image);
+    
+    *out_width = width;
+    *out_height = height;
+    *out_channels = channels;
+    return result;
+}

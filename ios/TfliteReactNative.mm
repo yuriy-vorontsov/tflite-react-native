@@ -55,31 +55,31 @@ RCT_EXPORT_METHOD(loadModel:(NSString *)model_file
   LOG(INFO) << "Loaded model " << graph_path;
   model->error_reporter();
   LOG(INFO) << "resolved reporter";
-  
+
   if (!model) {
     callback(@[[NSString stringWithFormat:@"%s %@", "Failed to mmap model", model_file]]);
   }
-  
+
   NSString* labels_path = [[NSBundle mainBundle] pathForResource:labels_file ofType:nil];
   if ([labels_path length] > 0) {
     LoadLabels(labels_path, &labels);
   }
-  
+
   tflite::ops::builtin::BuiltinOpResolver resolver;
   tflite::InterpreterBuilder(*model, resolver)(&interpreter);
   if (!interpreter) {
     callback(@[@"Failed to construct interpreter"]);
   }
-  
+
   if (interpreter->AllocateTensors() != kTfLiteOk) {
     callback(@[@"Failed to allocate tensors!"]);
   }
-  
+
   if (num_threads != -1) {
     interpreter->SetNumThreads(num_threads);
   }
-  
-  callback(@[[NSNull null], @"sucess"]);
+
+  callback(@[[NSNull null], @"success"]);
 }
 
 void feedInputTensor(uint8_t* in, int* input_size, int image_height, int image_width, int image_channels, float input_mean, float input_std) {
@@ -90,7 +90,7 @@ void feedInputTensor(uint8_t* in, int* input_size, int image_height, int image_w
   const int width = input_tensor->dims->data[2];
   const int height = input_tensor->dims->data[1];
   *input_size = width;
-  
+
   if (input_tensor->type == kTfLiteUInt8) {
     uint8_t* out = interpreter->typed_tensor<uint8_t>(input);
     for (int y = 0; y < height; ++y) {
@@ -124,6 +124,15 @@ void feedInputTensor(uint8_t* in, int* input_size, int image_height, int image_w
   }
 }
 
+void feedInputTensorImageFromBase64String(NSString* base64_string, float input_mean, float input_std, int* input_size) {
+    int image_channels;
+    int image_height;
+    int image_width;
+    std::vector<uint8_t> image_data = LoadImageFromBase64String(base64_string, &image_width, &image_height, &image_channels);
+    uint8_t* in = image_data.data();
+    feedInputTensor(in, input_size, image_height, image_width, image_channels, input_mean, input_std);
+}
+
 void feedInputTensorImage(const NSString* image_path, float input_mean, float input_std, int* input_size) {
   int image_channels;
   int image_height;
@@ -138,28 +147,28 @@ NSMutableArray* GetTopN(const float* prediction, const unsigned long prediction_
   std::priority_queue<std::pair<float, int>, std::vector<std::pair<float, int>>,
   std::greater<std::pair<float, int>>> top_result_pq;
   std::vector<std::pair<float, int>> top_results;
-  
+
   const long count = prediction_size;
   for (int i = 0; i < count; ++i) {
     const float value = prediction[i];
-    
+
     if (value < threshold) {
       continue;
     }
-    
+
     top_result_pq.push(std::pair<float, int>(value, i));
-    
+
     if (top_result_pq.size() > num_results) {
       top_result_pq.pop();
     }
   }
-  
+
   while (!top_result_pq.empty()) {
     top_results.push_back(top_result_pq.top());
     top_result_pq.pop();
   }
   std::reverse(top_results.begin(), top_results.end());
-  
+
   NSMutableArray* predictions = [NSMutableArray array];
   for (const auto& result : top_results) {
     const float confidence = result.first;
@@ -172,62 +181,122 @@ NSMutableArray* GetTopN(const float* prediction, const unsigned long prediction_
     [res setObject:valueObject forKey:@"confidence"];
     [predictions addObject:res];
   }
-  
+
   return predictions;
 }
 
-RCT_EXPORT_METHOD(runModelOnImage:(NSString*)image_path
+NSMutableArray* GetTopN(const uint8_t* prediction, const unsigned long prediction_size, const int num_results) {
+    std::priority_queue<std::pair<uint8_t, int>, std::vector<std::pair<uint8_t, int>>,
+    std::greater<std::pair<uint8_t, int>>> top_result_pq;
+    std::vector<std::pair<uint8_t, int>> top_results;
+
+    const long count = prediction_size;
+    for (int i = 0; i < count; ++i) {
+        const uint8_t value = prediction[i];
+
+        top_result_pq.push(std::pair<uint8_t, int>(value, i));
+
+        if (top_result_pq.size() > num_results) {
+            top_result_pq.pop();
+        }
+    }
+
+    while (!top_result_pq.empty()) {
+        top_results.push_back(top_result_pq.top());
+        top_result_pq.pop();
+    }
+    std::reverse(top_results.begin(), top_results.end());
+
+    NSMutableArray* predictions = [NSMutableArray array];
+    for (const auto& result : top_results) {
+        const float confidence = result.first / 255.0;
+        const int index = result.second;
+        NSString* labelObject = [NSString stringWithUTF8String:labels[index].c_str()];
+        NSNumber* valueObject = [NSNumber numberWithFloat:confidence];
+        NSMutableDictionary* res = [NSMutableDictionary dictionary];
+        [res setValue:[NSNumber numberWithInt:index] forKey:@"index"];
+        [res setObject:labelObject forKey:@"label"];
+        [res setObject:valueObject forKey:@"confidence"];
+        [predictions addObject:res];
+    }
+
+    return predictions;
+}
+
+RCT_EXPORT_METHOD(runModelOnImage:(NSString*)image_path_or_base64_string
                   mean:(float)input_mean
                   std:(float)input_std
                   numResults:(int)num_results
                   threshold:(float)threshold
                   callback:(RCTResponseSenderBlock)callback) {
-  
+
   if (!interpreter) {
     NSLog(@"Failed to construct interpreter.");
     callback(@[@"Failed to construct interpreter."]);
   }
-  
-  image_path = [image_path stringByReplacingOccurrencesOfString:@"file://" withString:@""];
+
   int input_size;
-  feedInputTensorImage(image_path, input_mean, input_std, &input_size);
-  
+  if ([image_path_or_base64_string rangeOfString:@"file://"].location == 0) {
+    image_path_or_base64_string = [image_path_or_base64_string stringByReplacingOccurrencesOfString:@"file://" withString:@""];
+    feedInputTensorImage(image_path_or_base64_string, input_mean, input_std, &input_size);
+
+  } else {
+    NSLog(@"Run feedInputTensorImageFromBase64String");
+    feedInputTensorImageFromBase64String(image_path_or_base64_string, input_mean, input_std, &input_size);
+  }
+
+  int input = interpreter->inputs()[0];
+  TfLiteTensor* input_tensor = interpreter->tensor(input);
+
   if (interpreter->Invoke() != kTfLiteOk) {
     NSLog(@"Failed to invoke!");
     callback(@[@"Failed to invoke!"]);
   }
-  
-  float* output = interpreter->typed_output_tensor<float>(0);
-  
-  if (output == NULL)
-    callback(@[@"No output!"]);
-  
+
   const unsigned long output_size = labels.size();
-  NSMutableArray* results = GetTopN(output, output_size, num_results, threshold);
-  callback(@[[NSNull null], results]);
+  if (input_tensor->type == kTfLiteUInt8) {
+    uint8_t* output = interpreter->typed_output_tensor<uint8_t>(0);
+    if (output == NULL) {
+      callback(@[@"No output!"]);
+      return;
+    }
+
+    NSMutableArray* results = GetTopN(output, output_size, num_results);
+    callback(@[[NSNull null], results]);
+
+  } else {
+    float* output = interpreter->typed_output_tensor<float>(0);
+    if (output == NULL) {
+      callback(@[@"No output!"]);
+      return;
+    }
+
+    NSMutableArray* results = GetTopN(output, output_size, num_results, threshold);
+    callback(@[[NSNull null], results]);
+  }
 }
 
 NSMutableArray* parseSSDMobileNet(float threshold, int num_results_per_class) {
   assert(interpreter->outputs().size() == 4);
-  
+
   NSMutableArray* results = [NSMutableArray array];
   float* output_locations = interpreter->typed_output_tensor<float>(0);
   float* output_classes = interpreter->typed_output_tensor<float>(1);
   float* output_scores = interpreter->typed_output_tensor<float>(2);
   float* num_detections = interpreter->typed_output_tensor<float>(3);
-  
+
   NSMutableDictionary* counters = [NSMutableDictionary dictionary];
   for (int d = 0; d < *num_detections; d++)
   {
     const int detected_class = output_classes[d];
     float score = output_scores[d];
-    
+
     if (score < threshold) continue;
-    
+
     NSMutableDictionary* res = [NSMutableDictionary dictionary];
     NSString* class_name = [NSString stringWithUTF8String:labels[detected_class + 1].c_str()];
     NSObject* counter = [counters objectForKey:class_name];
-    
+
     if (counter) {
       int countValue = [(NSNumber*)counter intValue] + 1;
       if (countValue > num_results_per_class) {
@@ -237,21 +306,21 @@ NSMutableArray* parseSSDMobileNet(float threshold, int num_results_per_class) {
     } else {
       [counters setObject:@(1) forKey:class_name];
     }
-    
+
     [res setObject:@(score) forKey:@"confidenceInClass"];
     [res setObject:class_name forKey:@"detectedClass"];
-    
+
     const float ymin = fmax(0, output_locations[d * 4]);
     const float xmin = fmax(0, output_locations[d * 4 + 1]);
     const float ymax = output_locations[d * 4 + 2];
     const float xmax = output_locations[d * 4 + 3];
-    
+
     NSMutableDictionary* rect = [NSMutableDictionary dictionary];
     [rect setObject:@(xmin) forKey:@"x"];
     [rect setObject:@(ymin) forKey:@"y"];
     [rect setObject:@(fmin(1 - xmin, xmax - xmin)) forKey:@"w"];
     [rect setObject:@(fmin(1 - ymin, ymax - ymin)) forKey:@"h"];
-    
+
     [res setObject:rect forKey:@"rect"];
     [results addObject:res];
   }
@@ -283,7 +352,7 @@ NSMutableArray* parseYOLO(int num_classes, const NSArray* anchors, int block_siz
   NSMutableArray* results = [NSMutableArray array];
   std::priority_queue<std::pair<float, NSMutableDictionary*>, std::vector<std::pair<float, NSMutableDictionary*>>,
   std::less<std::pair<float, NSMutableDictionary*>>> top_result_pq;
-  
+
   int grid_size = input_size / block_size;
   for (int y = 0; y < grid_size; ++y) {
     for (int x = 0; x < grid_size; ++x) {
@@ -291,16 +360,16 @@ NSMutableArray* parseYOLO(int num_classes, const NSArray* anchors, int block_siz
         int offset = (grid_size * (num_boxes_per_bolock * (num_classes + 5))) * y
         + (num_boxes_per_bolock * (num_classes + 5)) * x
         + (num_classes + 5) * b;
-        
+
         float confidence = sigmoid(output[offset + 4]);
-        
+
         float classes[num_classes];
         for (int c = 0; c < num_classes; ++c) {
           classes[c] = output[offset + 5 + c];
         }
-        
+
         softmax(classes, num_classes);
-        
+
         int detected_class = -1;
         float max_class = 0;
         for (int c = 0; c < num_classes; ++c) {
@@ -309,43 +378,43 @@ NSMutableArray* parseYOLO(int num_classes, const NSArray* anchors, int block_siz
             max_class = classes[c];
           }
         }
-        
+
         float confidence_in_class = max_class * confidence;
         if (confidence_in_class > threshold) {
           NSMutableDictionary* rect = [NSMutableDictionary dictionary];
           NSMutableDictionary* res = [NSMutableDictionary dictionary];
-          
+
           float xPos = (x + sigmoid(output[offset + 0])) * block_size;
           float yPos = (y + sigmoid(output[offset + 1])) * block_size;
-          
+
           float anchor_w = [[anchors objectAtIndex:(2 * b + 0)] floatValue];
           float anchor_h = [[anchors objectAtIndex:(2 * b + 1)] floatValue];
           float w = (float) (exp(output[offset + 2]) * anchor_w) * block_size;
           float h = (float) (exp(output[offset + 3]) * anchor_h) * block_size;
-          
+
           float x = fmax(0, (xPos - w / 2) / input_size);
           float y = fmax(0, (yPos - h / 2) / input_size);
           [rect setObject:@(x) forKey:@"x"];
           [rect setObject:@(y) forKey:@"y"];
           [rect setObject:@(fmin(1 - x, w / input_size)) forKey:@"w"];
           [rect setObject:@(fmin(1 - y, h / input_size)) forKey:@"h"];
-          
+
           [res setObject:rect forKey:@"rect"];
           [res setObject:@(confidence_in_class) forKey:@"confidenceInClass"];
           NSString* class_name = [NSString stringWithUTF8String:labels[detected_class].c_str()];
           [res setObject:class_name forKey:@"detectedClass"];
-          
+
           top_result_pq.push(std::pair<float, NSMutableDictionary*>(confidence_in_class, res));
         }
       }
     }
   }
-  
+
   NSMutableDictionary* counters = [NSMutableDictionary dictionary];
   while (!top_result_pq.empty()) {
     NSMutableDictionary* result = top_result_pq.top().second;
     top_result_pq.pop();
-    
+
     NSString* detected_class = [result objectForKey:@"detectedClass"];
     NSObject* counter = [counters objectForKey:detected_class];
     if (counter) {
@@ -359,7 +428,7 @@ NSMutableArray* parseYOLO(int num_classes, const NSArray* anchors, int block_siz
     }
     [results addObject:result];
   }
-  
+
   return results;
 }
 
@@ -376,24 +445,24 @@ RCT_EXPORT_METHOD(detectObjectOnImage:(NSString*)image_path
     NSLog(@"Failed to construct interpreter.");
     callback(@[@"Failed to construct interpreter."]);
   }
-  
+
   int input_size;
   image_path = [image_path stringByReplacingOccurrencesOfString:@"file://" withString:@""];
   feedInputTensorImage(image_path, input_mean, input_std, &input_size);
-  
+
   if (interpreter->Invoke() != kTfLiteOk) {
     NSLog(@"Failed to invoke!");
     callback(@[@"Failed to invoke!"]);
   }
-  
+
   NSMutableArray* results;
-  
+
   if ([model isEqual: @"SSDMobileNet"])
     results = parseSSDMobileNet(threshold, num_results_per_class);
   else
     results = parseYOLO((int)labels.size(), anchors, block_size, 5, num_results_per_class,
                         threshold, input_size);
-  
+
   callback(@[[NSNull null], results]);
 }
 
@@ -410,7 +479,7 @@ NSData* fetchArgmax(const NSArray* labelColors, const NSString* outputType) {
   const int height = output_tensor->dims->data[1];
   const int width = output_tensor->dims->data[2];
   const int channels = output_tensor->dims->data[3];
-  
+
   NSMutableData *data = nil;
   int size = height * width * 4;
   data = [[NSMutableData dataWithCapacity: size] initWithLength: size];
@@ -452,7 +521,7 @@ NSData* fetchArgmax(const NSArray* labelColors, const NSString* outputType) {
       }
     }
   }
-  
+
   if ([outputType isEqual: @"png"]) {
     CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
     CGContextRef bitmapContext = CGBitmapContextCreate(out,
@@ -462,7 +531,7 @@ NSData* fetchArgmax(const NSArray* labelColors, const NSString* outputType) {
                                                        4 * width, // bytesPerRow
                                                        colorSpace,
                                                        kCGImageAlphaNoneSkipLast);
-    
+
     CFRelease(colorSpace);
     CGImageRef cgImage = CGBitmapContextCreateImage(bitmapContext);
     NSData* image = UIImagePNGRepresentation([[UIImage alloc] initWithCGImage:cgImage]);
@@ -481,21 +550,21 @@ RCT_EXPORT_METHOD(runSegmentationOnImage:(NSString*)image_path
                   labelColors:(NSArray*)label_colors
                   outputType:(NSString*)output_type
                   callback:(RCTResponseSenderBlock)callback) {
-  
+
   if (!interpreter) {
     NSLog(@"Failed to construct interpreter.");
     callback(@[@"Failed to construct interpreter."]);
   }
-  
+
   image_path = [image_path stringByReplacingOccurrencesOfString:@"file://" withString:@""];
   int input_size;
   feedInputTensorImage(image_path, input_mean, input_std, &input_size);
-  
+
   if (interpreter->Invoke() != kTfLiteOk) {
     NSLog(@"Failed to invoke!");
     callback(@[@"Failed to invoke!"]);
   }
-  
+
   NSData* output = fetchArgmax(label_colors, output_type);
   NSString* base64String = [output base64EncodedStringWithOptions:0];
   callback(@[[NSNull null], base64String]);
@@ -531,7 +600,7 @@ void initPoseNet() {
   if ([parts_ids count] == 0) {
     for (int i = 0; i < [part_names count]; ++i)
       [parts_ids setValue:[NSNumber numberWithInt:i] forKey:part_names[i]];
-    
+
     for (int i = 0; i < [pose_chain count]; ++i) {
       [parent_to_child_edges addObject:parts_ids[pose_chain[i][1]]];
       [child_to_parent_edges addObject:parts_ids[pose_chain[i][0]]];
@@ -546,7 +615,7 @@ bool scoreIsMaximumInLocalWindow(int keypoint_id,
                                  int local_maximum_radius,
                                  float* scores) {
   bool local_maxium = true;
-  
+
   int y_start = MAX(heatmap_y - local_maximum_radius, 0);
   int y_end = MIN(heatmap_y + local_maximum_radius + 1, height);
   for (int y_current = y_start; y_current < y_end; ++y_current) {
@@ -579,7 +648,7 @@ PriorityQueue buildPartWithScoreQueue(float* scores,
         float score = sigmoid(scores[(heatmap_y * width + heatmap_x) *
                                      num_keypoints + keypoint_id]);
         if (score < threshold) continue;
-        
+
         if (scoreIsMaximumInLocalWindow(keypoint_id, score, heatmap_y, heatmap_x,
                                         local_maximum_radius, scores)) {
           NSMutableDictionary* res = [NSMutableDictionary dictionary];
@@ -601,7 +670,7 @@ void getImageCoords(float* res,
   int heatmap_y = [keypoint[@"y"] intValue];
   int heatmap_x = [keypoint[@"x"] intValue];
   int keypoint_id = [keypoint[@"partId"] intValue];
-  
+
   int offset = (heatmap_y * width + heatmap_x) * num_keypoints * 2 + keypoint_id;
   float offset_y = offsets[offset];
   float offset_x = offsets[offset + num_keypoints];
@@ -662,41 +731,41 @@ NSMutableDictionary* traverseToTargetKeypoint(int edge_id,
                                               int input_size) {
   float source_keypoint_y = [source_keypoint[@"y"] floatValue] * input_size;
   float source_keypoint_x = [source_keypoint[@"x"] floatValue] * input_size;
-  
+
   int source_keypoint_indices[2];
   getStridedIndexNearPoint(source_keypoint_indices, source_keypoint_y, source_keypoint_x);
-  
+
   float displacement[2];
   getDisplacement(displacement, edge_id, source_keypoint_indices, displacements);
-  
+
   float displaced_point[2];
   displaced_point[0] = source_keypoint_y + displacement[0];
   displaced_point[1] = source_keypoint_x + displacement[1];
-  
+
   float* target_keypoint = displaced_point;
-  
+
   int offset_refine_step = 2;
   for (int i = 0; i < offset_refine_step; i++) {
     int target_keypoint_indices[2];
     getStridedIndexNearPoint(target_keypoint_indices, target_keypoint[0], target_keypoint[1]);
-    
+
     int target_keypoint_y = target_keypoint_indices[0];
     int target_keypoint_x = target_keypoint_indices[1];
-    
+
     int offset = (target_keypoint_y * width + target_keypoint_x) * num_keypoints * 2 + target_keypoint_id;
     float offset_y = offsets[offset];
     float offset_x = offsets[offset + num_keypoints];
-    
+
     target_keypoint[0] = target_keypoint_y * output_stride + offset_y;
     target_keypoint[1] = target_keypoint_x * output_stride + offset_x;
   }
-  
+
   int target_keypoint_indices[2];
   getStridedIndexNearPoint(target_keypoint_indices, target_keypoint[0], target_keypoint[1]);
-  
+
   float score = sigmoid(scores[(target_keypoint_indices[0] * width +
                                 target_keypoint_indices[1]) * num_keypoints + target_keypoint_id]);
-  
+
   NSMutableDictionary* keypoint = [NSMutableDictionary dictionary];
   [keypoint setValue:[NSNumber numberWithFloat:score] forKey:@"score"];
   [keypoint setValue:[NSNumber numberWithFloat:target_keypoint[0] / input_size] forKey:@"y"];
@@ -707,45 +776,45 @@ NSMutableDictionary* traverseToTargetKeypoint(int edge_id,
 
 NSMutableArray* parsePoseNet(int num_results, float threshold, int nms_radius, int input_size) {
   initPoseNet();
-  
+
   assert(interpreter->outputs().size() == 4);
   TfLiteTensor* scores_tensor = interpreter->tensor(interpreter->outputs()[0]);
   height = scores_tensor->dims->data[1];
   width = scores_tensor->dims->data[2];
   num_keypoints = scores_tensor->dims->data[3];
-  
+
   float* scores = interpreter->typed_output_tensor<float>(0);
   float* offsets = interpreter->typed_output_tensor<float>(1);
   float* displacements_fwd = interpreter->typed_output_tensor<float>(2);
   float* displacements_bwd = interpreter->typed_output_tensor<float>(3);
-  
+
   PriorityQueue pq = buildPartWithScoreQueue(scores, threshold, local_maximum_radius);
-  
+
   int num_edges = (int)[parent_to_child_edges count];
   int sqared_nms_radius = nms_radius * nms_radius;
-  
+
   NSMutableArray* results = [NSMutableArray array];
-  
+
   while([results count] < num_results && !pq.empty()) {
     NSMutableDictionary* root = pq.top().second;
     pq.pop();
-    
+
     float root_point[2];
     getImageCoords(root_point, root, offsets);
-    
+
     if (withinNmsRadiusOfCorrespondingPoint(results, sqared_nms_radius, root_point[0], root_point[1],
                                             [root[@"partId"] intValue], input_size))
       continue;
-    
+
     NSMutableDictionary* keypoint = [NSMutableDictionary dictionary];
     [keypoint setValue:[NSNumber numberWithFloat:[root[@"score"] floatValue]] forKey:@"score"];
     [keypoint setValue:[NSNumber numberWithFloat:root_point[0] / input_size] forKey:@"y"];
     [keypoint setValue:[NSNumber numberWithFloat:root_point[1] / input_size] forKey:@"x"];
     [keypoint setValue:part_names[[root[@"partId"] intValue]] forKey:@"part"];
-    
+
     NSMutableDictionary* keypoints = [NSMutableDictionary dictionary];
     [keypoints setObject:keypoint forKey:root[@"partId"]];
-    
+
     for (int edge = num_edges - 1; edge >= 0; --edge) {
       int source_keypoint_id = [parent_to_child_edges[edge] intValue];
       int target_keypoint_id = [child_to_parent_edges[edge] intValue];
@@ -756,7 +825,7 @@ NSMutableArray* parsePoseNet(int num_results, float threshold, int nms_radius, i
         [keypoints setObject:keypoint forKey:[NSNumber numberWithInt:target_keypoint_id]];
       }
     }
-    
+
     for (int edge = 0; edge < num_edges; ++edge) {
       int source_keypoint_id = [child_to_parent_edges[edge] intValue];
       int target_keypoint_id = [parent_to_child_edges[edge] intValue];
@@ -767,13 +836,13 @@ NSMutableArray* parsePoseNet(int num_results, float threshold, int nms_radius, i
         [keypoints setObject:keypoint forKey:[NSNumber numberWithInt:target_keypoint_id]];
       }
     }
-    
+
     NSMutableDictionary* result = [NSMutableDictionary dictionary];
     [result setObject:keypoints forKey:@"keypoints"];
     [result setValue:[NSNumber numberWithFloat:getInstanceScore(keypoints)] forKey:@"score"];
     [results addObject:result];
   }
-  
+
   return results;
 }
 
@@ -788,16 +857,16 @@ RCT_EXPORT_METHOD(runPoseNetOnImage:(NSString*)image_path
     NSLog(@"Failed to construct interpreter.");
     callback(@[@"Failed to construct interpreter."]);
   }
-  
+
   image_path = [image_path stringByReplacingOccurrencesOfString:@"file://" withString:@""];
   int input_size;
   feedInputTensorImage(image_path, input_mean, input_std, &input_size);
-  
+
   if (interpreter->Invoke() != kTfLiteOk) {
     NSLog(@"Failed to invoke!");
     callback(@[@"Failed to invoke!"]);
   }
-  
+
   NSMutableArray* output = parsePoseNet(num_results, threshold, nms_radius, input_size);
   callback(@[[NSNull null], output]);
 }
